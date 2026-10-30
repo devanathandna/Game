@@ -1,8 +1,20 @@
 """
-HandRush - a hand-gesture arcade game (OpenCV + MediaPipe)
+HandRush - a hand-gesture arcade game, Vercel edition  (single file, zero dependencies)
 
-ONE window: the game is the main stage, your webcam is a Zoom-style
-self-view tile in the bottom-right corner (mirrored, rounded, with a LIVE badge).
+WHY THE OLD VERSION FAILED ON VERCEL
+  Vercel runs your code on a serverless machine: no webcam, no screen (cv2.imshow),
+  no writable disk, and opencv + mediapipe are far bigger than the 250 MB limit.
+  So the game now runs in the visitor's BROWSER (canvas + MediaPipe Tasks Vision JS,
+  same gestures, same rules) and this Python file only serves that page.
+
+DEPLOY
+  1. Keep this file as  app.py  in the repo root (index.py also works).
+  2. Delete any requirements.txt that lists opencv / mediapipe / numpy
+     (nothing needs installing - this file uses only the Python standard library).
+  3. `vercel` (or push to a repo connected to Vercel). Open the https:// URL.
+
+RUN LOCALLY
+  python app.py      ->  http://localhost:8000
 
 GESTURES
   Point (index finger) ... move the catcher
@@ -10,602 +22,705 @@ GESTURES
   Open palm (hold 1s) .... start / restart / resume
   Fist (hold 0.7s) ....... pause
 
-KEYS (fallbacks)
-  SPACE start/pause   R restart   C hide/show camera tile
-  F fullscreen        Q / ESC quit
-
-ITEMS
-  Blue orb +10 | Gold orb +30 | Bomb = lose a life (shield absorbs it)
-  Pink + = extra life | Blue S = shield | Purple T = slow-mo | Orange 2x = double points
-
-Install:  pip install opencv-python mediapipe==0.10.14 numpy
+KEYS / MOUSE
+  SPACE start/pause   R restart   C hide/show camera tile   F fullscreen
+  No camera?  Choose "Play with mouse / touch": move = catcher, hold click = slow-mo.
 """
 
-import json
-import math
-import os
-import random
-import time
-from collections import deque
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler
 
-import cv2
-import mediapipe as mp
-import numpy as np
+PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>HandRush</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #05050e; overflow: hidden;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; color: #fff; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; background: #140a28; touch-action: none; }
+  #gate { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 14px; padding: 24px; text-align: center;
+    background: rgba(8, 4, 20, .86); }
+  #gate[hidden] { display: none; }
+  #gate h1 { margin: 0; font-size: clamp(40px, 9vw, 84px); letter-spacing: .04em; color: #ffdc50; }
+  #gate p { margin: 0; max-width: 46ch; color: #d8d8e4; line-height: 1.45; }
+  #gate small { color: #8d8da6; max-width: 52ch; }
+  button { font: inherit; font-weight: 600; font-size: 18px; padding: 14px 28px; border-radius: 12px;
+    border: 2px solid #00ffb4; background: #00ffb4; color: #04140e; cursor: pointer; }
+  button:hover { filter: brightness(1.1); }
+  button:focus-visible { outline: 3px solid #fff; outline-offset: 3px; }
+  button[disabled] { opacity: .5; cursor: progress; }
+  button.ghost { background: transparent; color: #00ffb4; }
+  #status { min-height: 1.4em; color: #ffb45a; }
+  video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<video id="cam" playsinline muted></video>
 
-# ----------------------------------------------------------------- config
-W, H = 1280, 720                       # game stage size
-TILE_W, TILE_H, MARGIN = 320, 240, 24  # Zoom-style camera tile
-CATCHER_R = 46
-MAX_LIVES = 5
-SAVE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "handrush_save.json")
-FONT = cv2.FONT_HERSHEY_DUPLEX
+<div id="gate">
+  <h1>HAND RUSH</h1>
+  <p>Catch the orbs, dodge the bombs, and play with nothing but your hand in front of the webcam.</p>
+  <button id="btnCam">Enable camera</button>
+  <button id="btnMouse" class="ghost">Play with mouse / touch</button>
+  <p id="status" role="status"></p>
+  <small>Hand tracking runs inside your browser. Your video is never uploaded or stored.</small>
+</div>
 
-# BGR colours
-KINDS = {
-    "orb":    dict(w=58, r=26, col=(255, 200, 60),  label=""),
-    "gold":   dict(w=10, r=22, col=(0, 215, 255),   label="$"),
-    "bomb":   dict(w=18, r=28, col=(45, 45, 55),    label=""),
-    "heart":  dict(w=3,  r=24, col=(180, 105, 255), label="+"),
-    "shield": dict(w=4,  r=24, col=(255, 150, 50),  label="S"),
-    "slow":   dict(w=4,  r=24, col=(230, 90, 190),  label="T"),
-    "double": dict(w=4,  r=24, col=(0, 140, 255),   label="2x"),
+<script type="module">
+"use strict";
+
+// ------------------------------------------------------------- config
+const W = 1280, H = 720;
+const TILE_W = 320, TILE_H = 240, MARGIN = 24;
+const CATCHER_R = 46, MAX_LIVES = 5;
+const FONT = '"Segoe UI", system-ui, -apple-system, Roboto, sans-serif';
+const VERSION = "0.10.14";
+const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VERSION}/wasm`;
+const BUNDLE_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VERSION}/vision_bundle.mjs`;
+const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+// colours are [r, g, b]
+const KINDS = {
+  orb:    { w: 58, r: 26, col: [60, 200, 255],  label: "" },
+  gold:   { w: 10, r: 22, col: [255, 215, 0],   label: "$" },
+  bomb:   { w: 18, r: 28, col: [55, 45, 45],    label: "" },
+  heart:  { w: 3,  r: 24, col: [255, 105, 180], label: "+" },
+  shield: { w: 4,  r: 24, col: [50, 150, 255],  label: "S" },
+  slow:   { w: 4,  r: 24, col: [190, 90, 230],  label: "T" },
+  double: { w: 4,  r: 24, col: [255, 140, 0],   label: "2x" },
+};
+const RED = [255, 40, 40], WHITE = [255, 255, 255], TEAL = [0, 255, 180], GOLD = [255, 215, 0];
+const HAND_CONNECTIONS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("cam");
+const gate = document.getElementById("gate");
+const statusEl = document.getElementById("status");
+const btnCam = document.getElementById("btnCam");
+const btnMouse = document.getElementById("btnMouse");
+
+// ------------------------------------------------------------- helpers
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+const rgba = (c, a = 1) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+function text(s, x, y, scale = 1, col = WHITE, thick = 2, center = false) {
+  ctx.font = `${thick >= 3 ? 800 : 600} ${Math.round(scale * 32)}px ${FONT}`;
+  ctx.textAlign = center ? "center" : "left";
+  ctx.textBaseline = center ? "middle" : "alphabetic";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = thick + 3;
+  ctx.strokeStyle = "rgba(0,0,0,.75)";
+  ctx.strokeText(s, x, y);
+  ctx.fillStyle = rgba(col);
+  ctx.fillText(s, x, y);
 }
 
+function circle(x, y, r, fill, stroke, lw = 2) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.lineWidth = lw; ctx.strokeStyle = stroke; ctx.stroke(); }
+}
 
-# ----------------------------------------------------------------- helpers
-def ip(x, y):
-    return int(x), int(y)
+function line(x1, y1, x2, y2, col, lw) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.lineWidth = lw; ctx.strokeStyle = col; ctx.lineCap = "round"; ctx.stroke();
+}
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function loadBest() {
+  try { return parseInt(localStorage.getItem("handrush_best") || "0", 10) || 0; } catch { return 0; }
+}
+function saveBest(v) {
+  try { localStorage.setItem("handrush_best", String(v)); } catch { /* storage blocked */ }
+}
+
+// ------------------------------------------------------------- hand tracking
+let landmarker = null;
+let lastVideoTime = -1;
+let mode = "none"; // "hand" | "mouse" | "none"
+
+const tracker = {
+  pos: { x: W / 2, y: H / 2 }, present: false, lastSeen: performance.now() / 1000,
+  gesture: "none", pinchRatio: 1, lm: null,
+};
+
+const dist2 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function classify(p) {
+  let ext = 0;
+  for (const [t, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]]) {
+    if (dist2(p[t], p[0]) > dist2(p[pip], p[0]) * 1.05) ext++;
+  }
+  const scale = dist2(p[0], p[9]) || 1e-6;
+  tracker.pinchRatio = dist2(p[4], p[8]) / scale;
+  if (tracker.pinchRatio < 0.28) return "pinch";
+  if (ext >= 4) return "palm";
+  if (ext === 0) return "fist";
+  return "point";
+}
+
+function trackHand(now) {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  let res;
+  try { res = landmarker.detectForVideo(video, performance.now()); } catch { return; }
+  if (res.landmarks && res.landmarks.length) {
+    const p = res.landmarks[0];
+    tracker.lm = p;
+    tracker.present = true;
+    tracker.lastSeen = now;
+    const mx = 1 - p[8].x; // mirror, like a video call
+    const tx = clamp((mx - 0.12) / 0.76, 0, 1) * W;
+    const ty = clamp((p[8].y - 0.10) / 0.70, 0, 1) * H;
+    const d = Math.hypot(tx - tracker.pos.x, ty - tracker.pos.y);
+    const a = clamp(d / 160, 0.25, 0.85); // adaptive smoothing
+    tracker.pos.x += (tx - tracker.pos.x) * a;
+    tracker.pos.y += (ty - tracker.pos.y) * a;
+    tracker.gesture = classify(p);
+  } else {
+    tracker.present = false;
+    tracker.gesture = "none";
+    tracker.lm = null;
+  }
+}
+
+// mouse / touch fallback
+const mouse = { down: false };
+function pointerToStage(e) {
+  const r = canvas.getBoundingClientRect();
+  tracker.pos.x = clamp((e.clientX - r.left) / r.width * W, 0, W);
+  tracker.pos.y = clamp((e.clientY - r.top) / r.height * H, 0, H);
+}
+canvas.addEventListener("pointermove", (e) => { if (mode === "mouse") pointerToStage(e); });
+canvas.addEventListener("pointerdown", (e) => {
+  if (mode === "mouse") pointerToStage(e);
+  if (state !== "playing") { startOrResume(); return; }
+  if (mode === "mouse") mouse.down = true;
+});
+window.addEventListener("pointerup", () => { mouse.down = false; });
+window.addEventListener("pointercancel", () => { mouse.down = false; });
+
+// ------------------------------------------------------------- game logic
+class Game {
+  constructor() {
+    this.best = loadBest();
+    this.stars = Array.from({ length: 90 }, () => [rand(0, W), rand(0, H), rand(15, 70), 1 + Math.floor(Math.random() * 2)]);
+    this.reset();
+  }
+
+  reset() {
+    this.score = 0; this.lives = 3; this.level = 1; this.combo = 0; this.bestCombo = 0;
+    this.caught = 0; this.misses = 0; this.energy = 0;
+    this.shield = false; this.slowT = 0; this.doubleT = 0;
+    this.items = []; this.particles = []; this.popups = []; this.trail = [];
+    this.spawnT = 1.0; this.t = 0; this.flash = 0; this.shake = 0;
+    this.pinchActive = false; this.over = false; this.newRecord = false;
+  }
+
+  multiplier() { return Math.min(5, 1 + Math.floor(this.combo / 5)); }
+
+  burst(x, y, col, n = 18) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, Math.PI * 2), sp = rand(80, 340), life = rand(0.4, 0.9);
+      this.particles.push([x, y, Math.cos(a) * sp, Math.sin(a) * sp, life, life, col, 2 + Math.floor(Math.random() * 4)]);
+    }
+  }
+
+  popup(x, y, s, col = WHITE, size = 0.9) { this.popups.push([x, y, s, 1.0, col, size]); }
+
+  loseLife() {
+    this.lives -= 1;
+    this.flash = 0.5; this.shake = 0.4; this.combo = 0;
+    if (this.lives <= 0) {
+      this.over = true;
+      if (this.score > this.best) { this.best = this.score; this.newRecord = true; saveBest(this.best); }
+    }
+  }
+
+  spawn() {
+    const kinds = Object.keys(KINDS);
+    const weights = kinds.map((k) => KINDS[k].w + (k === "bomb" ? this.level * 1.5 : 0));
+    let roll = Math.random() * weights.reduce((a, b) => a + b, 0), k = kinds[0];
+    for (let i = 0; i < kinds.length; i++) { roll -= weights[i]; if (roll <= 0) { k = kinds[i]; break; } }
+    const r = KINDS[k].r;
+    this.items.push({ k, x: rand(r + 20, W - r - 20), y: -r, vy: 210 + this.level * 38 + rand(-30, 60), r, rot: rand(0, 6) });
+  }
+
+  update(dt, cur, pinching) {
+    this.t += dt;
+    let scale = 1.0;
+    if (this.slowT > 0) { this.slowT -= dt; scale = 0.5; }
+    this.pinchActive = !!(pinching && this.energy > 0);
+    if (this.pinchActive) { this.energy = Math.max(0, this.energy - 28 * dt); scale = Math.min(scale, 0.4); }
+    this.doubleT = Math.max(0, this.doubleT - dt);
+    this.flash = Math.max(0, this.flash - dt);
+    this.shake = Math.max(0, this.shake - dt);
+    const sdt = dt * scale;
+
+    this.trail.push([cur.x, cur.y]);
+    if (this.trail.length > 14) this.trail.shift();
+
+    this.spawnT -= sdt;
+    if (this.spawnT <= 0) {
+      this.spawn();
+      this.spawnT = Math.max(0.22, 0.85 - 0.06 * (this.level - 1)) * rand(0.7, 1.3);
+    }
+
+    const alive = [];
+    for (const it of this.items) {
+      it.y += it.vy * sdt;
+      it.rot += 2.5 * sdt;
+      if (Math.hypot(it.x - cur.x, it.y - cur.y) < it.r + CATCHER_R) { this.onCatch(it); continue; }
+      if (it.y > H + 40) {
+        if (it.k === "orb" || it.k === "gold") {
+          this.misses++; this.combo = 0;
+          if (this.misses >= 5) {
+            this.misses = 0;
+            this.popup(it.x, H - 60, "5 MISSES!", [255, 80, 80]);
+            this.loseLife();
+          }
+        }
+        continue;
+      }
+      alive.push(it);
+    }
+    this.items = alive;
+
+    for (const p of this.particles) {
+      p[0] += p[2] * dt; p[1] += p[3] * dt; p[3] += 400 * dt; p[4] -= dt;
+    }
+    this.particles = this.particles.filter((p) => p[4] > 0);
+    for (const pu of this.popups) { pu[1] -= 60 * dt; pu[3] -= dt * 0.9; }
+    this.popups = this.popups.filter((pu) => pu[3] > 0);
+    for (const s of this.stars) {
+      s[1] += s[2] * dt * (scale < 1 ? 0.5 : 1.0);
+      if (s[1] > H) { s[0] = rand(0, W); s[1] = 0; }
+    }
+  }
+
+  onCatch(it) {
+    const { k, x, y } = it, col = KINDS[k].col;
+    if (k === "bomb") {
+      if (this.shield) {
+        this.shield = false;
+        this.burst(x, y, [50, 150, 255], 30);
+        this.popup(x, y, "BLOCKED", [80, 180, 255]);
+      } else {
+        this.burst(x, y, RED, 36);
+        this.popup(x, y, "BOOM!", [255, 60, 60], 1.2);
+        this.loseLife();
+      }
+      return;
+    }
+    this.burst(x, y, col);
+    if (k === "orb" || k === "gold") {
+      const base = k === "orb" ? 10 : 30;
+      this.combo++;
+      this.bestCombo = Math.max(this.bestCombo, this.combo);
+      this.caught++;
+      const gained = base * this.multiplier() * (this.doubleT > 0 ? 2 : 1);
+      this.score += gained;
+      this.energy = Math.min(100, this.energy + (k === "orb" ? 4 : 10));
+      this.popup(x, y, `+${gained}`, col);
+      const newLevel = 1 + Math.floor(this.score / 200);
+      if (newLevel > this.level) {
+        this.level = newLevel;
+        this.popup(W / 2, H / 2 - 80, `LEVEL ${this.level}`, [0, 255, 200], 1.8);
+      }
+    } else if (k === "heart") {
+      this.lives = Math.min(MAX_LIVES, this.lives + 1);
+      this.popup(x, y, "+1 LIFE", col);
+    } else if (k === "shield") {
+      this.shield = true; this.popup(x, y, "SHIELD", col);
+    } else if (k === "slow") {
+      this.slowT = 5.0; this.popup(x, y, "SLOW-MO", col);
+    } else if (k === "double") {
+      this.doubleT = 8.0; this.popup(x, y, "2x POINTS", col);
+    }
+  }
+
+  // ---- drawing
+  drawItem(it) {
+    const k = KINDS[it.k], x = it.x, y = it.y, r = it.r;
+    if (it.k === "bomb") {
+      circle(x, y, r, rgba(k.col), rgba(RED), 3);
+      for (const a of [it.rot, it.rot + Math.PI / 2]) {
+        const dx = Math.cos(a) * r * 0.55, dy = Math.sin(a) * r * 0.55;
+        line(x - dx, y - dy, x + dx, y + dy, rgba([255, 60, 60]), 3);
+      }
+    } else {
+      circle(x, y, r, rgba(k.col), "#fff", 2);
+      circle(x - r / 3, y - r / 3, Math.max(2, r / 5), "#fff");
+      if (k.label) text(k.label, x + 2, y + 2, 0.65, WHITE, 2, true);
+    }
+  }
+
+  drawWorld() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "rgb(20,20,48)");
+    g.addColorStop(1, "rgb(40,6,22)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.save();
+    if (this.shake > 0) {
+      const m = this.shake * 30;
+      ctx.translate(rand(-m, m), rand(-m, m));
+    }
+
+    for (const s of this.stars) {
+      const c = 120 + s[3] * 40;
+      circle(s[0], s[1], s[3], `rgb(${c},${c},${c})`);
+    }
+
+    // glow
+    ctx.globalAlpha = 0.28;
+    for (const it of this.items) {
+      circle(it.x, it.y, it.r * 1.8, rgba(it.k === "bomb" ? RED : KINDS[it.k].col));
+    }
+    ctx.globalAlpha = 1;
+    for (const it of this.items) this.drawItem(it);
+
+    // trail
+    const pts = this.trail;
+    for (let i = 1; i < pts.length; i++) {
+      const a = i / pts.length;
+      line(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1],
+        `rgb(${90 * a | 0},${220 * a | 0},${255 * a | 0})`, Math.max(1, 14 * a));
+    }
+
+    for (const p of this.particles) circle(p[0], p[1], p[7], rgba(p[6], p[4] / p[5]));
+
+    // catcher
+    const cx = tracker.pos.x, cy = tracker.pos.y;
+    let ring = this.pinchActive ? [190, 90, 230] : [120, 255, 255];
+    if (!tracker.present) ring = [120, 120, 120];
+    circle(cx, cy, CATCHER_R, null, rgba(ring), 3);
+    circle(cx, cy, 6, rgba(ring));
+    if (this.shield) {
+      const pulse = Math.floor(8 * Math.sin(this.t * 6));
+      circle(cx, cy, CATCHER_R + 14 + Math.trunc(pulse / 2), null, rgba([50, 150, 255]), 3);
+    }
+
+    for (const [x, y, s, life, col, size] of this.popups) {
+      ctx.globalAlpha = Math.min(1, life * 1.5);
+      text(s, x, y, size, col, 2, true);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    if (this.flash > 0) { ctx.fillStyle = rgba(RED, this.flash); ctx.fillRect(0, 0, W, H); }
+    if (this.pinchActive) { ctx.fillStyle = "rgba(30,50,120,.1)"; ctx.fillRect(0, 0, W, H); }
+  }
+
+  drawHud(fps) {
+    text(`SCORE ${this.score}`, 24, 44, 1.1, WHITE, 2);
+    text(`BEST ${this.best}`, 24, 78, 0.65, GOLD, 1);
+    text(`LEVEL ${this.level}`, W / 2 - 90, 40, 0.9, [0, 255, 200], 2);
+    const mult = this.multiplier();
+    text(`COMBO ${this.combo}  x${mult}`, W / 2 - 130, 76, 0.75, mult > 1 ? GOLD : [200, 200, 200], 2);
+
+    for (let i = 0; i < MAX_LIVES; i++) {
+      const cx = W - 36 - i * 38, cy = 36;
+      circle(cx, cy, 13, i < this.lives ? "rgb(255,105,180)" : null, "#fff", 2);
+    }
+    text(`Misses ${this.misses}/5`, W - 160, 76, 0.6, [200, 200, 200], 1);
+
+    const bx = 24, by = 100, bw = 240, bh = 16;
+    ctx.fillStyle = "#3c3c3c"; ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = "rgb(190,90,230)"; ctx.fillRect(bx, by, bw * this.energy / 100, bh);
+    ctx.lineWidth = 1; ctx.strokeStyle = "#fff"; ctx.strokeRect(bx, by, bw, bh);
+    text(mode === "mouse" ? "SLOW-MO ENERGY (hold click)" : "SLOW-MO ENERGY (pinch)", bx, by + 38, 0.5, [220, 170, 230], 1);
+
+    let y = by + 66;
+    for (const [label, on, col] of [
+      ["SHIELD READY", this.shield, [50, 150, 255]],
+      [`SLOW-MO ${Math.ceil(this.slowT)}s`, this.slowT > 0, [190, 90, 230]],
+      [`2x POINTS ${Math.ceil(this.doubleT)}s`, this.doubleT > 0, [255, 140, 0]],
+    ]) {
+      if (on) { text(label, bx, y, 0.6, col, 2); y += 28; }
+    }
+    text(`${fps.toFixed(0)} FPS`, W - 110, H - 12 - (mode === "hand" ? TILE_H + MARGIN : 0), 0.45, [150, 150, 150], 1);
+  }
+}
+
+// ------------------------------------------------------------- Zoom-style camera tile
+function drawTile() {
+  const x0 = W - TILE_W - MARGIN, y0 = H - TILE_H - MARGIN, iw = TILE_W - 6, ih = TILE_H - 6;
+  ctx.save();
+  rr(x0 - 8, y0 - 8, TILE_W + 16, TILE_H + 16, 22); ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.fill();
+  rr(x0, y0, TILE_W, TILE_H, 16); ctx.fillStyle = tracker.present ? "#00dc78" : "#6e6e6e"; ctx.fill();
+
+  rr(x0 + 3, y0 + 3, iw, ih, 13); ctx.clip();
+  const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+  const sw = Math.min(vw, vh * 4 / 3), sx = (vw - sw) / 2; // centre-crop to 4:3
+  if (video.readyState >= 2) {
+    ctx.save();
+    ctx.translate(x0 + 3 + iw, y0 + 3);
+    ctx.scale(-1, 1); // mirror
+    ctx.drawImage(video, sx, 0, sw, vh, 0, 0, iw, ih);
+    ctx.restore();
+  } else {
+    ctx.fillStyle = "#111"; ctx.fillRect(x0 + 3, y0 + 3, iw, ih);
+  }
+
+  // skeleton
+  if (tracker.lm) {
+    const P = tracker.lm.map((l) => [x0 + 3 + iw - ((l.x * vw - sx) / sw) * iw, y0 + 3 + l.y * ih]);
+    for (const [a, b] of HAND_CONNECTIONS) line(P[a][0], P[a][1], P[b][0], P[b][1], "#00ffb4", 3);
+    for (const p of P) circle(p[0], p[1], 3.5, "#fff");
+  }
+
+  // name bar
+  ctx.fillStyle = "rgba(0,0,0,.65)"; ctx.fillRect(x0 + 3, y0 + 3 + ih - 34, iw, 34);
+  text("You", x0 + 3 + 34, y0 + 3 + ih - 11, 0.55, WHITE, 1);
+  const gest = tracker.present ? tracker.gesture.toUpperCase() : "NO HAND";
+  ctx.font = `600 16px ${FONT}`;
+  const gw = ctx.measureText(gest).width;
+  text(gest, x0 + 3 + iw - gw - 10, y0 + 3 + ih - 11, 0.5, TEAL, 1);
+  circle(x0 + 3 + 18, y0 + 3 + ih - 17, 6, tracker.present ? "rgb(0,220,120)" : "rgb(255,80,80)");
+
+  // LIVE badge
+  ctx.fillStyle = "rgb(220,40,40)"; ctx.fillRect(x0 + 3 + 8, y0 + 3 + 8, 54, 20);
+  text("LIVE", x0 + 3 + 14, y0 + 3 + 23, 0.45, WHITE, 1);
+  ctx.restore();
+}
+
+// ------------------------------------------------------------- screens
+function holdRing(cx, cy, progress) {
+  ctx.lineWidth = 5;
+  ctx.beginPath(); ctx.arc(cx, cy, 34, 0, Math.PI * 2); ctx.strokeStyle = "#505050"; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, 34, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, progress));
+  ctx.strokeStyle = "#00ffb4"; ctx.stroke();
+}
+
+function drawOverlay(state, game, holdProg) {
+  const m = mode === "mouse";
+  if (state === "playing") {
+    text(m ? "Mouse: move  |  Hold click: slow-mo  |  SPACE: pause"
+           : "Point: move  |  Pinch: slow-mo  |  Fist (hold): pause", 24, H - 20, 0.5, [190, 190, 190], 1);
+    return;
+  }
+  ctx.fillStyle = "rgba(0,0,0,.6)"; ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H / 2;
+  if (state === "menu") {
+    text("HAND RUSH", cx, cy - 170, 3.0, [255, 220, 80], 5, true);
+    text("Catch the orbs. Dodge the bombs. Use only your hand.", cx, cy - 100, 0.9, [230, 230, 230], 1, true);
+    const lines = m
+      ? ["MOUSE  - move the catcher", "CLICK  - hold for slow-mo (needs energy)", "SPACE  - pause / resume", "TAP    - start / resume"]
+      : ["POINT  - move the catcher", "PINCH  - slow-mo (needs energy)", "FIST   - pause (hold)", "PALM   - start / resume (hold 1s)"];
+    lines.forEach((s, i) => text(s, cx - 230, cy - 30 + i * 34, 0.75, WHITE, 1));
+    text(m ? "Click / tap or press SPACE to start" : "Hold an OPEN PALM to start  (or press SPACE)", cx, cy + 150, 0.95, TEAL, 2, true);
+    text(`Best score: ${game.best}`, cx, cy + 195, 0.8, GOLD, 1, true);
+  } else if (state === "paused") {
+    text("PAUSED", cx, cy - 40, 2.6, WHITE, 4, true);
+    text(m ? "Click / tap or press SPACE to resume" : "Hold an OPEN PALM to resume  (or press SPACE)", cx, cy + 50, 0.9, TEAL, 2, true);
+  } else if (state === "over") {
+    text("GAME OVER", cx, cy - 150, 2.6, [255, 80, 80], 4, true);
+    text(`Score ${game.score}`, cx, cy - 70, 1.4, WHITE, 2, true);
+    text(`Level ${game.level}   Caught ${game.caught}   Best combo ${game.bestCombo}`, cx, cy - 20, 0.8, [210, 210, 210], 1, true);
+    if (game.newRecord) text("NEW RECORD!", cx, cy + 30, 1.2, GOLD, 3, true);
+    else text(`Best ${game.best}`, cx, cy + 30, 0.9, GOLD, 1, true);
+    text(m ? "Click / tap or press R to play again" : "Hold an OPEN PALM to play again  (or press R)", cx, cy + 100, 0.9, TEAL, 2, true);
+  }
+  if (holdProg > 0) holdRing(cx, cy + 250, holdProg);
+}
+
+// ------------------------------------------------------------- main loop
+const game = new Game();
+let state = "menu"; // menu | playing | paused | over
+let showCam = true;
+let hold = 0, prev = performance.now() / 1000, fps = 60;
+
+function startOrResume() {
+  if (mode === "none") return;          // wait for the gate choice
+  if (state === "menu" || state === "over") game.reset();
+  state = "playing";
+  mouse.down = false;
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now() / 1000;
+  const dt = Math.min(0.05, now - prev);
+  prev = now;
+  fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
+
+  if (mode === "hand") {
+    trackHand(now);
+  } else if (mode === "mouse") {
+    tracker.present = true;
+    tracker.lastSeen = now;
+    tracker.gesture = mouse.down ? "pinch" : "point";
+  }
+
+  // gesture-driven state machine
+  const want = state === "playing" ? "fist" : "palm";
+  const need = state === "playing" ? 0.7 : 1.0;
+  hold = (mode === "hand" && tracker.present && tracker.gesture === want) ? hold + dt : 0;
+  if (hold >= need) {
+    hold = 0;
+    if (state === "playing") state = "paused"; else startOrResume();
+  }
+
+  if (state === "playing") {
+    if (mode === "hand" && !tracker.present && now - tracker.lastSeen > 2.0) {
+      state = "paused"; // auto-pause when the hand disappears
+    } else {
+      game.update(dt, tracker.pos, tracker.gesture === "pinch" && tracker.present);
+      if (game.over) state = "over";
+    }
+  }
+
+  // render
+  game.drawWorld();
+  if (state !== "menu") game.drawHud(fps);
+  drawOverlay(state, game, hold / need);
+  if (mode === "hand" && !tracker.present && state === "playing") {
+    text("Show your hand to the camera", W / 2, H - 60, 0.9, [255, 180, 80], 2, true);
+  }
+  if (mode === "hand" && showCam) drawTile();
+}
+
+// ------------------------------------------------------------- input: keyboard
+window.addEventListener("keydown", (e) => {
+  const k = e.key.toLowerCase();
+  if (k === " ") {
+    e.preventDefault();
+    if (mode === "none") return;
+    if (state === "playing") state = "paused"; else startOrResume();
+  } else if (k === "r") {
+    if (mode === "none") return;
+    game.reset(); state = "playing";
+  } else if (k === "c") {
+    showCam = !showCam;
+  } else if (k === "f") {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else document.documentElement.requestFullscreen?.();
+  } else if ((k === "escape" || k === "q") && state === "playing") {
+    state = "paused";
+  }
+});
+document.addEventListener("visibilitychange", () => { if (document.hidden && state === "playing") state = "paused"; });
+
+// ------------------------------------------------------------- layout
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width = Math.floor(W * s) + "px";
+  canvas.style.height = Math.floor(H * s) + "px";
+}
+window.addEventListener("resize", fit);
+fit();
+
+// ------------------------------------------------------------- start-up (camera or mouse)
+const setStatus = (s) => { statusEl.textContent = s; };
+
+async function startCamera() {
+  btnCam.disabled = true; btnMouse.disabled = true;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("This browser can't access a camera here (HTTPS is required).");
+    }
+    setStatus("Loading hand-tracking model…");
+    const vision = await import(BUNDLE_URL);
+    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_URL);
+    const make = (delegate) => vision.HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: MODEL_URL, delegate },
+      runningMode: "VIDEO",
+      numHands: 1,
+      minHandDetectionConfidence: 0.7,
+      minHandPresenceConfidence: 0.6,
+      minTrackingConfidence: 0.6,
+    });
+    try { landmarker = await make("GPU"); } catch { landmarker = await make("CPU"); }
+
+    setStatus("Waiting for camera permission…");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    mode = "hand";
+    gate.hidden = true;
+  } catch (err) {
+    const name = err && err.name;
+    if (name === "NotAllowedError") setStatus("Camera permission was blocked. Allow it in the address bar, then try again.");
+    else if (name === "NotFoundError") setStatus("No camera found. Plug one in, or play with the mouse.");
+    else if (name === "NotReadableError") setStatus("The camera is busy in another app. Close it and try again.");
+    else setStatus((err && err.message) || "Could not start the camera or load the model.");
+    btnCam.disabled = false; btnMouse.disabled = false;
+    btnCam.textContent = "Try camera again";
+  }
+}
+
+btnCam.addEventListener("click", startCamera);
+btnMouse.addEventListener("click", () => { mode = "mouse"; gate.hidden = true; });
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+"""
+
+BODY = PAGE.encode("utf-8")
+HEADERS = [
+    ("Content-Type", "text/html; charset=utf-8"),
+    ("Cache-Control", "public, max-age=0, must-revalidate"),
+    ("Permissions-Policy", "camera=(self)"),
+    ("X-Content-Type-Options", "nosniff"),
+]
 
 
-def put_text(img, s, pos, scale=1.0, color=(255, 255, 255), thick=2, center=False):
-    (tw, th), _ = cv2.getTextSize(s, FONT, scale, thick)
-    x, y = pos
-    if center:
-        x -= tw // 2
-        y += th // 2
-    x, y = int(x), int(y)
-    cv2.putText(img, s, (x + 2, y + 2), FONT, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, s, (x, y), FONT, scale, color, thick, cv2.LINE_AA)
+def _respond(path):
+    """Returns (status_code, headers, body) for a request path."""
+    if path == "/favicon.ico":
+        return 204, [], b""
+    return 200, HEADERS + [("Content-Length", str(len(BODY)))], BODY
 
 
-def rounded_mask(w, h, r):
-    m = np.zeros((h, w), np.uint8)
-    cv2.rectangle(m, (r, 0), (w - r, h), 255, -1)
-    cv2.rectangle(m, (0, r), (w, h - r), 255, -1)
-    for c in ((r, r), (w - r, r), (r, h - r), (w - r, h - r)):
-        cv2.circle(m, c, r, 255, -1)
-    return m > 0
+# --- Vercel entrypoint #1: WSGI callable named `app` ------------------------
+def app(environ, start_response):
+    code, headers, body = _respond(environ.get("PATH_INFO", "/"))
+    start_response(f"{code} {HTTPStatus(code).phrase}", headers)
+    return [body]
 
 
-def dim(img, amount=0.55):
-    return cv2.addWeighted(img, 1 - amount, np.zeros_like(img), amount, 0)
+# --- Vercel entrypoint #2: classic `handler` class (works in /api too) ------
+class handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        code, headers, body = _respond(self.path.split("?", 1)[0])
+        self.send_response(code)
+        for key, value in headers:
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
 
-
-def load_best():
-    try:
-        with open(SAVE_FILE) as f:
-            return int(json.load(f).get("best", 0))
-    except Exception:
-        return 0
-
-
-def save_best(v):
-    try:
-        with open(SAVE_FILE, "w") as f:
-            json.dump({"best": int(v)}, f)
-    except Exception:
+    def log_message(self, *args):  # keep logs quiet
         pass
 
 
-# ----------------------------------------------------------------- hand tracking
-class HandTracker:
-    def __init__(self):
-        self.mp_hands = mp.solutions.hands
-        self.drawer = mp.solutions.drawing_utils
-        self.hands = self.mp_hands.Hands(
-            max_num_hands=1,
-            model_complexity=0,
-            min_detection_confidence=0.7,
-            min_tracking_confidence=0.6,
-        )
-        self.pos = np.array([W / 2, H / 2], dtype=float)
-        self.present = False
-        self.last_seen = time.perf_counter()
-        self.gesture = "none"
-        self.pinch_ratio = 1.0
-
-    @staticmethod
-    def _d(a, b):
-        return math.hypot(a.x - b.x, a.y - b.y)
-
-    def _classify(self, p):
-        d = self._d
-        wrist = p[0]
-        ext = sum(d(p[t], wrist) > d(p[pip], wrist) * 1.05
-                  for t, pip in ((8, 6), (12, 10), (16, 14), (20, 18)))
-        scale = d(p[0], p[9]) or 1e-6
-        self.pinch_ratio = d(p[4], p[8]) / scale
-        if self.pinch_ratio < 0.28:
-            return "pinch"
-        if ext >= 4:
-            return "palm"
-        if ext == 0:
-            return "fist"
-        return "point"
-
-    def update(self, cam_bgr):
-        """Processes a (already mirrored) frame and draws the skeleton on it."""
-        rgb = cv2.cvtColor(cam_bgr, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        res = self.hands.process(rgb)
-        if res.multi_hand_landmarks:
-            hand = res.multi_hand_landmarks[0]
-            p = hand.landmark
-            self.present = True
-            self.last_seen = time.perf_counter()
-            # map the central part of the camera view to the whole stage
-            tx = float(np.clip((p[8].x - 0.12) / 0.76, 0, 1)) * W
-            ty = float(np.clip((p[8].y - 0.10) / 0.70, 0, 1)) * H
-            target = np.array([tx, ty])
-            dist = float(np.linalg.norm(target - self.pos))
-            alpha = float(np.clip(dist / 160.0, 0.25, 0.85))  # adaptive smoothing
-            self.pos += (target - self.pos) * alpha
-            self.gesture = self._classify(p)
-            self.drawer.draw_landmarks(
-                cam_bgr, hand, self.mp_hands.HAND_CONNECTIONS,
-                self.drawer.DrawingSpec(color=(0, 255, 180), thickness=3, circle_radius=3),
-                self.drawer.DrawingSpec(color=(255, 255, 255), thickness=2),
-            )
-        else:
-            self.present = False
-            self.gesture = "none"
-
-
-# ----------------------------------------------------------------- game logic
-class Game:
-    def __init__(self):
-        self.best = load_best()
-        rng = np.random.RandomState(7)
-        self.stars = [[rng.uniform(0, W), rng.uniform(0, H), rng.uniform(15, 70), rng.randint(1, 3)]
-                      for _ in range(90)]
-        top = np.array([48, 20, 20], np.float32)
-        bot = np.array([22, 6, 40], np.float32)
-        grad = np.linspace(top, bot, H)[:, None, :].repeat(W, axis=1)
-        self.bg = grad.astype(np.uint8)
-        self.reset()
-
-    def reset(self):
-        self.score = 0
-        self.lives = 3
-        self.level = 1
-        self.combo = 0
-        self.best_combo = 0
-        self.caught = 0
-        self.misses = 0
-        self.energy = 0.0
-        self.shield = False
-        self.slow_t = 0.0
-        self.double_t = 0.0
-        self.items, self.particles, self.popups = [], [], []
-        self.trail = deque(maxlen=14)
-        self.spawn_t = 1.0
-        self.t = 0.0
-        self.flash = 0.0
-        self.shake = 0.0
-        self.pinch_active = False
-        self.over = False
-        self.new_record = False
-
-    # ---- helpers
-    def multiplier(self):
-        return min(5, 1 + self.combo // 5)
-
-    def burst(self, x, y, col, n=18):
-        for _ in range(n):
-            a = random.uniform(0, math.tau)
-            sp = random.uniform(80, 340)
-            life = random.uniform(0.4, 0.9)
-            self.particles.append([x, y, math.cos(a) * sp, math.sin(a) * sp, life, life, col,
-                                   random.randint(2, 5)])
-
-    def popup(self, x, y, s, col=(255, 255, 255), size=0.9):
-        self.popups.append([x, y, s, 1.0, col, size])
-
-    def lose_life(self):
-        self.lives -= 1
-        self.flash, self.shake, self.combo = 0.5, 0.4, 0
-        if self.lives <= 0:
-            self.over = True
-            if self.score > self.best:
-                self.best, self.new_record = self.score, True
-                save_best(self.best)
-
-    def spawn(self):
-        kinds = list(KINDS)
-        weights = [KINDS[k]["w"] + (self.level * 1.5 if k == "bomb" else 0) for k in kinds]
-        k = random.choices(kinds, weights)[0]
-        r = KINDS[k]["r"]
-        speed = 210 + self.level * 38 + random.uniform(-30, 60)
-        self.items.append(dict(k=k, x=random.uniform(r + 20, W - r - 20), y=-r,
-                               vy=speed, r=r, rot=random.uniform(0, 6)))
-
-    # ---- update
-    def update(self, dt, cur, pinching):
-        self.t += dt
-        scale = 1.0
-        if self.slow_t > 0:
-            self.slow_t -= dt
-            scale = 0.5
-        self.pinch_active = bool(pinching and self.energy > 0)
-        if self.pinch_active:
-            self.energy = max(0.0, self.energy - 28 * dt)
-            scale = min(scale, 0.4)
-        self.double_t = max(0.0, self.double_t - dt)
-        self.flash = max(0.0, self.flash - dt)
-        self.shake = max(0.0, self.shake - dt)
-        sdt = dt * scale
-
-        self.trail.append(ip(*cur))
-
-        self.spawn_t -= sdt
-        if self.spawn_t <= 0:
-            self.spawn()
-            self.spawn_t = max(0.22, 0.85 - 0.06 * (self.level - 1)) * random.uniform(0.7, 1.3)
-
-        alive = []
-        for it in self.items:
-            it["y"] += it["vy"] * sdt
-            it["rot"] += 2.5 * sdt
-            if math.hypot(it["x"] - cur[0], it["y"] - cur[1]) < it["r"] + CATCHER_R:
-                self.on_catch(it)
-                continue
-            if it["y"] > H + 40:
-                if it["k"] in ("orb", "gold"):
-                    self.misses += 1
-                    self.combo = 0
-                    if self.misses >= 5:
-                        self.misses = 0
-                        self.popup(it["x"], H - 60, "5 MISSES!", (80, 80, 255))
-                        self.lose_life()
-                continue
-            alive.append(it)
-        self.items = alive
-
-        for p in self.particles:
-            p[0] += p[2] * dt
-            p[1] += p[3] * dt
-            p[3] += 400 * dt
-            p[4] -= dt
-        self.particles = [p for p in self.particles if p[4] > 0]
-        for pu in self.popups:
-            pu[1] -= 60 * dt
-            pu[3] -= dt * 0.9
-        self.popups = [pu for pu in self.popups if pu[3] > 0]
-        for s in self.stars:
-            s[1] += s[2] * dt * (0.5 if scale < 1 else 1.0)
-            if s[1] > H:
-                s[0], s[1] = random.uniform(0, W), 0
-
-    def on_catch(self, it):
-        k, x, y = it["k"], it["x"], it["y"]
-        col = KINDS[k]["col"]
-        if k == "bomb":
-            if self.shield:
-                self.shield = False
-                self.burst(x, y, (255, 150, 50), 30)
-                self.popup(x, y, "BLOCKED", (255, 180, 80))
-            else:
-                self.burst(x, y, (40, 40, 255), 36)
-                self.popup(x, y, "BOOM!", (60, 60, 255), 1.2)
-                self.lose_life()
-            return
-        self.burst(x, y, col)
-        if k in ("orb", "gold"):
-            base = 10 if k == "orb" else 30
-            self.combo += 1
-            self.best_combo = max(self.best_combo, self.combo)
-            self.caught += 1
-            gained = base * self.multiplier() * (2 if self.double_t > 0 else 1)
-            self.score += gained
-            self.energy = min(100.0, self.energy + (4 if k == "orb" else 10))
-            self.popup(x, y, f"+{gained}", col)
-            new_level = 1 + self.score // 200
-            if new_level > self.level:
-                self.level = new_level
-                self.popup(W / 2, H / 2 - 80, f"LEVEL {self.level}", (0, 255, 200), 1.8)
-        elif k == "heart":
-            self.lives = min(MAX_LIVES, self.lives + 1)
-            self.popup(x, y, "+1 LIFE", col)
-        elif k == "shield":
-            self.shield = True
-            self.popup(x, y, "SHIELD", col)
-        elif k == "slow":
-            self.slow_t = 5.0
-            self.popup(x, y, "SLOW-MO", col)
-        elif k == "double":
-            self.double_t = 8.0
-            self.popup(x, y, "2x POINTS", col)
-
-    # ---- drawing
-    def draw_item(self, img, it):
-        k = KINDS[it["k"]]
-        x, y = ip(it["x"], it["y"])
-        r = it["r"]
-        if it["k"] == "bomb":
-            cv2.circle(img, (x, y), r, k["col"], -1, cv2.LINE_AA)
-            cv2.circle(img, (x, y), r, (40, 40, 255), 3, cv2.LINE_AA)
-            for a in (it["rot"], it["rot"] + math.pi / 2):
-                dx, dy = math.cos(a) * r * 0.55, math.sin(a) * r * 0.55
-                cv2.line(img, ip(x - dx, y - dy), ip(x + dx, y + dy), (60, 60, 255), 3, cv2.LINE_AA)
-        else:
-            cv2.circle(img, (x, y), r, k["col"], -1, cv2.LINE_AA)
-            cv2.circle(img, (x, y), r, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.circle(img, (x - r // 3, y - r // 3), max(2, r // 5), (255, 255, 255), -1, cv2.LINE_AA)
-            if k["label"]:
-                put_text(img, k["label"], (x + 2, y + 2), 0.65, (255, 255, 255), 2, center=True)
-
-    def draw_world(self, tracker):
-        f = self.bg.copy()
-        for s in self.stars:
-            c = 120 + s[3] * 40
-            cv2.circle(f, ip(s[0], s[1]), s[3], (c, c, c), -1)
-
-        # glow layer (one blend per frame)
-        ov = f.copy()
-        for it in self.items:
-            gc = (40, 40, 255) if it["k"] == "bomb" else KINDS[it["k"]]["col"]
-            cv2.circle(ov, ip(it["x"], it["y"]), int(it["r"] * 1.8), gc, -1, cv2.LINE_AA)
-        f = cv2.addWeighted(ov, 0.28, f, 0.72, 0)
-        for it in self.items:
-            self.draw_item(f, it)
-
-        # trail
-        pts = list(self.trail)
-        for i in range(1, len(pts)):
-            a = i / len(pts)
-            cv2.line(f, pts[i - 1], pts[i], (int(255 * a), int(220 * a), int(90 * a)),
-                     max(1, int(14 * a)), cv2.LINE_AA)
-
-        for p in self.particles:
-            a = p[4] / p[5]
-            col = tuple(int(c * a) for c in p[6])
-            cv2.circle(f, ip(p[0], p[1]), p[7], col, -1)
-
-        # catcher / cursor
-        cx, cy = ip(*tracker.pos)
-        ring = (230, 90, 190) if self.pinch_active else (255, 255, 120)
-        if not tracker.present:
-            ring = (120, 120, 120)
-        cv2.circle(f, (cx, cy), CATCHER_R, ring, 3, cv2.LINE_AA)
-        cv2.circle(f, (cx, cy), 6, ring, -1, cv2.LINE_AA)
-        if self.shield:
-            pulse = int(8 * math.sin(self.t * 6))
-            cv2.circle(f, (cx, cy), CATCHER_R + 14 + pulse // 2, (255, 150, 50), 3, cv2.LINE_AA)
-
-        for x, y, s, life, col, size in self.popups:
-            c = tuple(int(v * min(1.0, life * 1.5)) for v in col)
-            put_text(f, s, (x, y), size, c, 2, center=True)
-
-        if self.shake > 0:
-            m = self.shake * 30
-            M = np.float32([[1, 0, random.uniform(-m, m)], [0, 1, random.uniform(-m, m)]])
-            f = cv2.warpAffine(f, M, (W, H))
-        if self.flash > 0:
-            f = cv2.addWeighted(f, 1 - self.flash, np.full_like(f, (0, 0, 255)), self.flash, 0)
-        if self.pinch_active:  # blue-ish tint for slow-mo
-            f = cv2.addWeighted(f, 0.9, np.full_like(f, (120, 50, 30)), 0.1, 0)
-        return f
-
-    def draw_hud(self, f, fps):
-        put_text(f, f"SCORE {self.score}", (24, 44), 1.1, (255, 255, 255), 2)
-        put_text(f, f"BEST {self.best}", (24, 78), 0.65, (0, 215, 255), 1)
-        put_text(f, f"LEVEL {self.level}", (W // 2 - 90, 40), 0.9, (0, 255, 200), 2)
-        mult = self.multiplier()
-        ccol = (0, 215, 255) if mult > 1 else (200, 200, 200)
-        put_text(f, f"COMBO {self.combo}  x{mult}", (W // 2 - 130, 76), 0.75, ccol, 2)
-
-        # lives
-        for i in range(MAX_LIVES):
-            c = (W - 36 - i * 38, 36)
-            if i < self.lives:
-                cv2.circle(f, c, 13, (180, 105, 255), -1, cv2.LINE_AA)
-            cv2.circle(f, c, 13, (255, 255, 255), 2, cv2.LINE_AA)
-        put_text(f, f"Misses {self.misses}/5", (W - 160, 76), 0.6, (200, 200, 200), 1)
-
-        # energy bar
-        bx, by, bw, bh = 24, 100, 240, 16
-        cv2.rectangle(f, (bx, by), (bx + bw, by + bh), (60, 60, 60), -1)
-        cv2.rectangle(f, (bx, by), (bx + int(bw * self.energy / 100), by + bh), (230, 90, 190), -1)
-        cv2.rectangle(f, (bx, by), (bx + bw, by + bh), (255, 255, 255), 1)
-        put_text(f, "SLOW-MO ENERGY (pinch)", (bx, by + 38), 0.5, (230, 170, 220), 1)
-
-        # active power-ups
-        y = by + 66
-        for label, on, col in (
-            (f"SHIELD READY", self.shield, (255, 150, 50)),
-            (f"SLOW-MO {self.slow_t:.0f}s", self.slow_t > 0, (230, 90, 190)),
-            (f"2x POINTS {self.double_t:.0f}s", self.double_t > 0, (0, 140, 255)),
-        ):
-            if on:
-                put_text(f, label, (bx, y), 0.6, col, 2)
-                y += 28
-        put_text(f, f"{fps:.0f} FPS", (W - 110, H - 12 - (TILE_H + MARGIN if True else 0)), 0.45,
-                 (150, 150, 150), 1)
-
-
-# ----------------------------------------------------------------- Zoom-style camera tile
-class CameraTile:
-    def __init__(self):
-        self.outer = rounded_mask(TILE_W, TILE_H, 16)
-        self.iw, self.ih = TILE_W - 6, TILE_H - 6
-        self.inner = rounded_mask(self.iw, self.ih, 13)
-
-    def draw(self, canvas, cam, tracker):
-        x0, y0 = W - TILE_W - MARGIN, H - TILE_H - MARGIN
-        # soft shadow
-        s = canvas[y0 - 8:y0 + TILE_H + 8, x0 - 8:x0 + TILE_W + 8]
-        s[:] = (s * 0.5).astype(np.uint8)
-
-        # centre-crop to 4:3
-        h, w = cam.shape[:2]
-        target_w = int(h * 4 / 3)
-        if target_w < w:
-            off = (w - target_w) // 2
-            cam = cam[:, off:off + target_w]
-        tile = cv2.resize(cam, (self.iw, self.ih))
-
-        # name bar
-        bar = tile[-34:]
-        bar[:] = (bar * 0.35).astype(np.uint8)
-        gest = tracker.gesture.upper() if tracker.present else "NO HAND"
-        put_text(tile, "You", (34, self.ih - 11), 0.55, (255, 255, 255), 1)
-        put_text(tile, gest, (self.iw - 100, self.ih - 11), 0.5, (0, 255, 180), 1)
-        cv2.circle(tile, (18, self.ih - 17), 6, (80, 80, 255) if not tracker.present else (0, 220, 120), -1)
-
-        # LIVE badge
-        cv2.rectangle(tile, (8, 8), (62, 28), (40, 40, 220), -1)
-        put_text(tile, "LIVE", (14, 23), 0.45, (255, 255, 255), 1, )
-
-        border = (0, 220, 120) if tracker.present else (110, 110, 110)
-        roi = canvas[y0:y0 + TILE_H, x0:x0 + TILE_W]
-        roi[self.outer] = border
-        sub = roi[3:3 + self.ih, 3:3 + self.iw]
-        sub[self.inner] = tile[self.inner]
-
-
-# ----------------------------------------------------------------- screens
-def hold_ring(f, center, progress):
-    cv2.ellipse(f, center, (34, 34), -90, 0, 360, (80, 80, 80), 5, cv2.LINE_AA)
-    cv2.ellipse(f, center, (34, 34), -90, 0, int(360 * min(1, progress)), (0, 255, 180), 5, cv2.LINE_AA)
-
-
-def draw_overlay(f, state, game, hold_prog):
-    if state == "playing":
-        put_text(f, "Point: move  |  Pinch: slow-mo  |  Fist (hold): pause", (24, H - 20), 0.5,
-                 (190, 190, 190), 1)
-        return
-    f[:] = dim(f, 0.6)
-    cx, cy = W // 2, H // 2
-    if state == "menu":
-        put_text(f, "HAND RUSH", (cx, cy - 170), 3.0, (255, 220, 80), 5, center=True)
-        put_text(f, "Catch the orbs. Dodge the bombs. Use only your hand.", (cx, cy - 100), 0.9,
-                 (230, 230, 230), 1, center=True)
-        lines = ["POINT  - move the catcher", "PINCH  - slow-mo (needs energy)",
-                 "FIST   - pause (hold)", "PALM   - start / resume (hold 1s)"]
-        for i, s in enumerate(lines):
-            put_text(f, s, (cx - 190, cy - 30 + i * 34), 0.75, (255, 255, 255), 1)
-        put_text(f, "Hold an OPEN PALM to start  (or press SPACE)", (cx, cy + 150), 0.95,
-                 (0, 255, 180), 2, center=True)
-        put_text(f, f"Best score: {game.best}", (cx, cy + 195), 0.8, (0, 215, 255), 1, center=True)
-    elif state == "paused":
-        put_text(f, "PAUSED", (cx, cy - 40), 2.6, (255, 255, 255), 4, center=True)
-        put_text(f, "Hold an OPEN PALM to resume  (or press SPACE)", (cx, cy + 50), 0.9,
-                 (0, 255, 180), 2, center=True)
-    elif state == "over":
-        put_text(f, "GAME OVER", (cx, cy - 150), 2.6, (80, 80, 255), 4, center=True)
-        put_text(f, f"Score {game.score}", (cx, cy - 70), 1.4, (255, 255, 255), 2, center=True)
-        put_text(f, f"Level {game.level}   Caught {game.caught}   Best combo {game.best_combo}",
-                 (cx, cy - 20), 0.8, (210, 210, 210), 1, center=True)
-        if game.new_record:
-            put_text(f, "NEW RECORD!", (cx, cy + 30), 1.2, (0, 215, 255), 3, center=True)
-        else:
-            put_text(f, f"Best {game.best}", (cx, cy + 30), 0.9, (0, 215, 255), 1, center=True)
-        put_text(f, "Hold an OPEN PALM to play again  (or press R)", (cx, cy + 100), 0.9,
-                 (0, 255, 180), 2, center=True)
-    if hold_prog > 0:
-        hold_ring(f, (cx, cy + 250), hold_prog)
-
-
-# ----------------------------------------------------------------- main loop
-def main():
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Could not open the camera. Close other apps using it or try VideoCapture(1).")
-        return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    tracker, game, tile = HandTracker(), Game(), CameraTile()
-    win = "HandRush"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win, W, H)
-
-    state = "menu"          # menu | playing | paused | over
-    show_cam, fullscreen = True, False
-    hold, prev, fps = 0.0, time.perf_counter(), 30.0
-
-    while True:
-        ok, cam = cap.read()
-        if not ok:
-            break
-        cam = cv2.flip(cam, 1)      # mirror, like a video call
-        tracker.update(cam)
-
-        now = time.perf_counter()
-        dt = min(0.05, now - prev)
-        prev = now
-        fps = fps * 0.9 + (1 / max(dt, 1e-3)) * 0.1
-
-        # ---- gesture-driven state machine
-        want = "fist" if state == "playing" else "palm"
-        need = 0.7 if state == "playing" else 1.0
-        hold = hold + dt if (tracker.present and tracker.gesture == want) else 0.0
-        if hold >= need:
-            hold = 0.0
-            if state == "playing":
-                state = "paused"
-            else:
-                if state in ("menu", "over"):
-                    game.reset()
-                state = "playing"
-
-        if state == "playing":
-            if not tracker.present and now - tracker.last_seen > 2.0:
-                state = "paused"    # auto-pause when your hand disappears
-            else:
-                game.update(dt, tracker.pos, tracker.gesture == "pinch" and tracker.present)
-                if game.over:
-                    state = "over"
-
-        # ---- render
-        frame = game.draw_world(tracker)
-        if state in ("playing", "paused", "over"):
-            game.draw_hud(frame, fps)
-        draw_overlay(frame, state, game, hold / need)
-        if not tracker.present and state == "playing":
-            put_text(frame, "Show your hand to the camera", (W // 2, H - 60), 0.9, (80, 180, 255), 2,
-                     center=True)
-        if show_cam:
-            tile.draw(frame, cam, tracker)
-        cv2.imshow(win, frame)
-
-        # ---- keyboard fallbacks
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
-            break
-        elif key == ord(" "):
-            if state in ("menu", "over"):
-                game.reset()
-                state = "playing"
-            elif state == "playing":
-                state = "paused"
-            else:
-                state = "playing"
-        elif key == ord("r"):
-            game.reset()
-            state = "playing"
-        elif key == ord("c"):
-            show_cam = not show_cam
-        elif key == ord("f"):
-            fullscreen = not fullscreen
-            cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN,
-                                  cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
-        if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
+# --- Local run: python app.py ----------------------------------------------
 if __name__ == "__main__":
-    main()
+    from wsgiref.simple_server import make_server
+
+    print("HandRush running at http://localhost:8000  (Ctrl+C to stop)")
+    make_server("", 8000, app).serve_forever()
